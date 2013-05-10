@@ -186,6 +186,19 @@ performance scales linearly with your connector/controller.</p>
 <p>Alternately you can download the ZIP or TAR file from the links at the left.
 When you unpack/untar the file, it acreates an /aerospike-act- directory.</p>
 
+<p><strong>Install the Required Libraries</strong>
+Before you can build ACT, you need to install some libraries.</p>
+
+<p>For CentOS:</p>
+
+<pre><code>$ sudo yum install make gcc openssl-devel
+</code></pre>
+
+<p>For Debian or Ubuntu:</p>
+
+<pre><code>$ sudo apt-get install make gcc libc6-dev libssl-dev
+</code></pre>
+
 <p><strong>Build the package.</strong></p>
 
 <pre><code>$ cd act    OR    cd /aerospike-act-&lt;version&gt;
