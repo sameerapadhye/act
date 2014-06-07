@@ -83,6 +83,7 @@ const uint32_t NUM_SCHEDULER_MODES = sizeof(SCHEDULER_MODES) / sizeof(char*);
 #define MAXEVENTS 10000 /* TODO this is actually max events per worker thread */
 #define AS_ASYNC_READ 1
 #define AS_TIMER 2
+#define MAX_EVENTFDS 10000
 
 
 /*********************************************************************************************
@@ -144,8 +145,8 @@ static pthread_mutex_t g_rand_64_lock = PTHREAD_MUTEX_INITIALIZER;
 
 static char g_device_names[MAX_NUM_DEVICES][MAX_DEVICE_NAME_SIZE];
 static uint32_t g_num_devices = 0;
-static uint32_t g_num_timers = 8; //TODO default? 
-static uint32_t g_worker_threads = 8; //TODO default? 
+static uint32_t g_num_timers = 1; //TODO default? 
+static uint32_t g_worker_threads = 1; //TODO default? 
 static uint64_t g_run_ms = 0;
 static uint32_t g_report_interval_ms = 0;
 static uint64_t g_read_reqs_per_sec = 0;
@@ -168,6 +169,10 @@ static histogram* g_p_large_block_read_histogram;
 static histogram* g_p_large_block_write_histogram;
 static histogram* g_p_raw_read_histogram;
 static histogram* g_p_read_histogram;
+
+static cf_queue* async_info_queue;/* Queue of all the as_async_info_t pointers that are mallocd */ 
+static as_async_info_t *async_info_array;/* Actual mallocd as_async_info_t structs */
+static cf_queue *eventfd_queue;
 
 /*********************************************************************************************
   FORWARD DECLARATION
@@ -281,17 +286,21 @@ static void generate_async_read(int async_epfd)
 	{
 		return;
 	}	
-	if (cf_atomic_int_incr(&g_read_reqs_queued) > MAX_READ_REQS_QUEUED) {
-		fprintf(stdout, "ERROR: too many read reqs queued\n");
-		fprintf(stdout, "drive(s) can't keep up - test stopped\n");
-		g_running = false;
+
+	/* Create the struct of info needed at the process_read end, to be sent through epoll */
+	//as_async_info_t *info = (as_async_info_t*)malloc(sizeof(as_async_info_t));
+	uintptr_t info_ptr;
+	if (cf_queue_pop(async_info_queue, (void*)&info_ptr, CF_QUEUE_NOWAIT) !=
+			CF_QUEUE_OK) 
+	{
+		fprintf(stdout, "Error: Could not pop info struct \n");
 		return;
 	}
 
-	/* Create the struct of info needed at the process_read end, to be sent through epoll */
-	as_async_info_t *info = (as_async_info_t*)malloc(sizeof(as_async_info_t));
+	as_async_info_t *info = (as_async_info_t*)info_ptr;
 	if(info == NULL)
 	{
+//FIXME no need for this check
 		fprintf(stdout, "Error: Malloc Fail \n");	
 		return;
 	}
@@ -317,15 +326,17 @@ static void generate_async_read(int async_epfd)
 	struct epoll_event *epev = &(info->event);
 	epev->events = EPOLLIN | EPOLLONESHOT;
 	epev->data.ptr = info;
-	/* Create eventfd for the read request */
-	int efd = eventfd(0,EFD_NONBLOCK);  
+	/* Get eventfd for the read request */
+	int efd;
+	cf_queue_pop(eventfd_queue,(void*)&efd, CF_QUEUE_NOWAIT);  
 	if(efd < 0)
 	{
-		fprintf(stdout, "Error: Creating eventfd failed \n");
+		fprintf(stdout, "Error: Invalid eventfd \n");
+		fprintf(stdout, "errno %d\n", errno);
 		goto fail;
 	}
 	info->efd = efd;
-	if(epoll_ctl(async_epfd, EPOLL_CTL_ADD, efd, epev) < 0)
+	if(epoll_ctl(async_epfd, EPOLL_CTL_MOD, efd, epev) < 0)
 	{
 		fprintf(stdout,"Error: epoll ctl failed \n");
 		goto fail;
@@ -364,19 +375,34 @@ static void generate_async_read(int async_epfd)
 			goto fail;
 		}
 	}
+	//TODO
+	cf_atomic_int_incr(&g_read_reqs_queued); 
+	/*if (cf_atomic_int_incr(&g_read_reqs_queued) > MAX_READ_REQS_QUEUED) {
+		fprintf(stdout, "ERROR: too many read reqs queued\n");
+		fprintf(stdout, "drive(s) can't keep up - test stopped\n");
+		g_running = false;
+		return;
+	}*/
 	return;
+
 
 	/* Rollback for failure */
 	fail:
 	if(info)
 	{
-		free(info);
+		uintptr_t temp = (uintptr_t)info;
+		cf_queue_push(async_info_queue, (void*)&temp);
+		//free(info);
 	}
+/*
 	errno = 0;
 	if(fcntl(efd, F_GETFD) != -1)
 	{
 		close(efd);
 	}
+*/
+	
+	cf_queue_push(eventfd_queue, (void*)&efd);
 }
 
 /* Processing reads when they return from aio_read */
@@ -387,7 +413,6 @@ static void process_read(as_async_info_t *info)
 		return;
 	}
 	cf_atomic_int_decr(&g_read_reqs_queued);
-
 	uint64_t stop_time = cf_getms();
 	fd_put(info->p_readreq.p_device, info->fd);
 	
@@ -405,8 +430,13 @@ static void process_read(as_async_info_t *info)
 	{
 		free(info->p_buffer);
 	}
-	close(info->efd); /* Close eventfd */
-	free(info);
+	//close(info->efd); /* Close eventfd */
+	//TODO read eventfd? To reset to zero? 
+	cf_queue_push(eventfd_queue, (void*)&(info->efd));	
+
+	uintptr_t temp = (uintptr_t)info;
+	cf_queue_push(async_info_queue, (void*)&temp);
+	//free(info);
 }
 
 /* Called by each worker thread */
@@ -419,7 +449,7 @@ static void* worker_func(void *async_epfd)
 	as_async_info_t *reference;
 
 	/* Calculate required timer rate */
-	int rate = g_read_reqs_per_sec/g_num_timers;
+	int rate = (g_read_reqs_per_sec/g_num_timers);
 	
 	while(g_running)
 	{
@@ -430,10 +460,20 @@ static void* worker_func(void *async_epfd)
 		{
 			continue;
 		}
+
+		/* Process the read requests queued upfirst */
+		for(i = 0; i < num_events; i++)
+		{
+			reference = (as_async_info_t*)events[i].data.ptr;
+			if(reference->flag == AS_ASYNC_READ)
+			{
+				process_read(reference);
+			}  
+		}
+
 		for(i = 0; i < num_events; i++)
 		{
 			reference = (as_async_info_t *)events[i].data.ptr;
-
 			/* Timer event - generate reads */
 			if(reference->flag == AS_TIMER)
 			{
@@ -483,19 +523,81 @@ static void* worker_func(void *async_epfd)
 				if(epoll_ctl(*(int*)async_epfd, EPOLL_CTL_MOD, 
 							reference->fd, &reference->event) < 0)
 				{
-					fprintf(stdout, "Error: epoll ctl failed\n");
+					fprintf(stdout, "Error: Timer epoll ctl failed\n");
 					continue;//FIXME
 				}  
 			}
 			/* read completion event */
-			else if(reference->flag == AS_ASYNC_READ)
+			/*else if(reference->flag == AS_ASYNC_READ)
 			{
 				process_read(reference);
-			}  
+			} */ 
 		}
 	}
 	free(events);
 	return (0);	
+}
+
+static void create_async_info_queue()
+{
+	int i;
+	uintptr_t info;
+	as_async_info_t *temp_info;
+	async_info_queue = cf_queue_create(sizeof(uintptr_t), true);
+
+	async_info_array = (as_async_info_t*)malloc(MAX_READ_REQS_QUEUED * sizeof(as_async_info_t));
+	if(async_info_array == NULL)
+	{
+		fprintf(stdout, "Error: Malloc info structs failed.\n Exiting. \n");
+		cf_queue_destroy(async_info_queue);
+		exit(-1);
+	}
+
+	for(i = 0; i < MAX_READ_REQS_QUEUED; i++)
+	{
+		temp_info = async_info_array + i;
+		info = (uintptr_t)temp_info;
+		cf_queue_push(async_info_queue, (void*)&info);
+	}
+}
+
+static void destroy_async_info_queue()
+{
+	free(async_info_array);
+	cf_queue_destroy(async_info_queue);
+}
+	
+static void create_eventfd_queue(int async_epfd)
+{
+	int i, efd;
+	eventfd_queue = cf_queue_create(sizeof(int), true);
+	for(i = 0; i < MAX_EVENTFDS; i++)
+	{
+		efd = eventfd(0,EFD_NONBLOCK);  
+		cf_queue_push(eventfd_queue, (void*)&efd);
+		
+		struct epoll_event event;
+		event.events = EPOLLIN | EPOLLONESHOT;	
+		
+		if(epoll_ctl(async_epfd, EPOLL_CTL_ADD, efd, &event) < 0)
+		{
+			fprintf(stdout,"Error: epoll ctl failed \n");
+			exit(-1);
+		} 
+	}
+}
+
+
+static void destroy_eventfd_queue()
+{
+	int i, efd;		
+	for(i = 0; i < MAX_EVENTFDS; i++)
+	{
+		cf_queue_pop(eventfd_queue, (void*)&efd, CF_QUEUE_NOWAIT);
+		if(efd != -1)
+			close(efd);
+	}
+	cf_queue_destroy(eventfd_queue);
 }
 
 int main(int argc, char* argv[]) {
@@ -588,6 +690,9 @@ int main(int argc, char* argv[]) {
 		exit(-1);
 	} 
 
+	create_async_info_queue();
+	create_eventfd_queue(async_epfd);
+	
 	/* Create the worker threads */
 	pthread_t workers[g_worker_threads];
 	int j;
@@ -603,7 +708,7 @@ int main(int argc, char* argv[]) {
 
 	/* Timerfd mechanism */
 	/* Calculate initial timer interval */
-	int rate = g_read_reqs_per_sec/g_num_timers;
+	int rate = (g_read_reqs_per_sec/g_num_timers);
 	float ms;
 	int timerfds[g_num_timers];
 	as_async_info_t* timer_info_array[g_num_timers]; 
@@ -615,6 +720,8 @@ int main(int argc, char* argv[]) {
 		{
 			fprintf(stdout, "Error: Timerfds not created \n");
 			close(async_epfd);
+			destroy_eventfd_queue();
+			destroy_async_info_queue();
 			exit(-1);
 		}
 
@@ -631,6 +738,8 @@ int main(int argc, char* argv[]) {
 		{
 			fprintf(stdout, "Error: timerfd_settime error\n");
 			close(async_epfd);
+			destroy_eventfd_queue();
+			destroy_async_info_queue();
 			exit(-1);
 		}
 
@@ -653,6 +762,8 @@ int main(int argc, char* argv[]) {
 				free(timer_info_array[j]);
 			}
 			close(async_epfd);
+			destroy_eventfd_queue();
+			destroy_async_info_queue();
 			exit(-1);
 		} 
 	}
@@ -720,7 +831,9 @@ int main(int argc, char* argv[]) {
 		free(timer_info_array[i]);
 	}
 	close(async_epfd);
-	
+	destroy_eventfd_queue();
+	destroy_async_info_queue();
+
 	int d;
 	for (d = 0; d < g_num_devices; d++) {
 		device* p_device = &g_devices[d];
@@ -1112,7 +1225,7 @@ static int fd_get(device* p_device) {
 		fd = open(p_device->name, O_DIRECT | O_RDWR, S_IRUSR | S_IWUSR);
 
 		if (fd == -1) {
-			fprintf(stdout, "ERROR: open device %s\n", p_device->name);
+			fprintf(stdout, "ERROR: open device %s \n", p_device->name);
 		}
 	}
 
