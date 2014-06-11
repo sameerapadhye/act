@@ -4,7 +4,7 @@ DIR_OBJECT = .
 DIR_TARGET = .
 
 HEADERS = atomic.h clock.h histogram.h queue.h
-SOURCES = async_act.c clock.c histogram.c queue.c
+SOURCES = aio.c clock.c histogram.c queue.c
 TARGET = act
 
 CC = gcc
