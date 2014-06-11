@@ -174,6 +174,9 @@ static cf_queue* async_info_queue;/* Queue of all the as_async_info_t pointers t
 static as_async_info_t *async_info_array;/* Actual mallocd as_async_info_t structs */
 static cf_queue *eventfd_queue;
 
+
+volatile long unsigned int g_timer_events = 0;
+
 /*********************************************************************************************
   FORWARD DECLARATION
  *********************************************************************************************/
@@ -266,7 +269,20 @@ static int read_async_from_device(as_async_info_t *info, int efd)
 
 	struct aiocb *aio_cb = &info->aio_cb;
 	aio_read_setup(aio_cb, fd, info->p_readreq.offset, info->p_buffer, info->p_readreq.size, efd);
-	
+/*
+ //To verify there is data on the disk 	
+	if(lseek(fd, info->p_readreq.offset, SEEK_SET)!= info->p_readreq.offset)
+	{
+		fprintf(stdout,"issues moving \n");
+		exit(-1);
+	}
+	if(read(fd, info->p_buffer, info->p_readreq.size) != (ssize_t)info->p_readreq.size)
+	{
+		fprintf(stdout,"issues reading %d\n", errno);
+		exit(-1);
+	}
+*/
+
 	if(aio_read(aio_cb) < 0)
 	{ 
 		close(fd);
@@ -288,7 +304,6 @@ static void generate_async_read(int async_epfd)
 	}	
 
 	/* Create the struct of info needed at the process_read end, to be sent through epoll */
-	//as_async_info_t *info = (as_async_info_t*)malloc(sizeof(as_async_info_t));
 	uintptr_t info_ptr;
 	if (cf_queue_pop(async_info_queue, (void*)&info_ptr, CF_QUEUE_NOWAIT) !=
 			CF_QUEUE_OK) 
@@ -300,7 +315,7 @@ static void generate_async_read(int async_epfd)
 	as_async_info_t *info = (as_async_info_t*)info_ptr;
 	if(info == NULL)
 	{
-//FIXME no need for this check
+		//FIXME redundant check
 		fprintf(stdout, "Error: Malloc Fail \n");	
 		return;
 	}
@@ -328,7 +343,12 @@ static void generate_async_read(int async_epfd)
 	epev->data.ptr = info;
 	/* Get eventfd for the read request */
 	int efd;
-	cf_queue_pop(eventfd_queue,(void*)&efd, CF_QUEUE_NOWAIT);  
+	if(cf_queue_pop(eventfd_queue,(void*)&efd, CF_QUEUE_NOWAIT) == CF_QUEUE_EMPTY)  
+	{
+	//	fprintf(stdout, "Too many open eventfds\n");
+		efd = -1;
+		goto fail;
+	}
 	if(efd < 0)
 	{
 		fprintf(stdout, "Error: Invalid eventfd \n");
@@ -375,14 +395,13 @@ static void generate_async_read(int async_epfd)
 			goto fail;
 		}
 	}
-	//TODO
-	cf_atomic_int_incr(&g_read_reqs_queued); 
-	/*if (cf_atomic_int_incr(&g_read_reqs_queued) > MAX_READ_REQS_QUEUED) {
+	if (cf_atomic_int_incr(&g_read_reqs_queued) > MAX_READ_REQS_QUEUED) 
+	{
 		fprintf(stdout, "ERROR: too many read reqs queued\n");
 		fprintf(stdout, "drive(s) can't keep up - test stopped\n");
 		g_running = false;
 		return;
-	}*/
+	}
 	return;
 
 
@@ -392,17 +411,9 @@ static void generate_async_read(int async_epfd)
 	{
 		uintptr_t temp = (uintptr_t)info;
 		cf_queue_push(async_info_queue, (void*)&temp);
-		//free(info);
 	}
-/*
-	errno = 0;
-	if(fcntl(efd, F_GETFD) != -1)
-	{
-		close(efd);
-	}
-*/
-	
-	cf_queue_push(eventfd_queue, (void*)&efd);
+	if(efd != -1)	
+		cf_queue_push(eventfd_queue, (void*)&efd);
 }
 
 /* Processing reads when they return from aio_read */
@@ -415,7 +426,13 @@ static void process_read(as_async_info_t *info)
 	cf_atomic_int_decr(&g_read_reqs_queued);
 	uint64_t stop_time = cf_getms();
 	fd_put(info->p_readreq.p_device, info->fd);
-	
+	/* Checking to see if the read request is complete */
+	if(aio_error(&info->aio_cb) == EINPROGRESS )
+	{
+		fprintf(stdout, "READ INCOMPLETE\n");
+		exit(-1);
+	}
+
 	if (stop_time != -1) 
 	{
 		histogram_insert_data_point(g_p_raw_read_histogram,
@@ -430,13 +447,13 @@ static void process_read(as_async_info_t *info)
 	{
 		free(info->p_buffer);
 	}
-	//close(info->efd); /* Close eventfd */
-	//TODO read eventfd? To reset to zero? 
+	/* Resetting eventfd counter */
+	uint64_t value;
+	read(info->efd, &value, sizeof(uint64_t));
+	/* Recycling eventfd and info struct */
 	cf_queue_push(eventfd_queue, (void*)&(info->efd));	
-
 	uintptr_t temp = (uintptr_t)info;
 	cf_queue_push(async_info_queue, (void*)&temp);
-	//free(info);
 }
 
 /* Called by each worker thread */
@@ -477,6 +494,9 @@ static void* worker_func(void *async_epfd)
 			/* Timer event - generate reads */
 			if(reference->flag == AS_TIMER)
 			{
+				//TODO remove after debugging - counting timer events 
+				cf_atomic_int_incr(&g_timer_events);
+				/* Reading timerfd */
 				read(reference->fd, &read_val,sizeof(uint64_t)); 
 				timerfd = reference->fd;
 				generate_async_read(*(int*)async_epfd);
@@ -620,7 +640,6 @@ int main(int argc, char* argv[]) {
 		exit(-1);
 	}
 
-
 	fprintf(stdout, "\nAerospike act - device IO test\n");
 	fprintf(stdout, "Copyright 2011 by Aerospike. All rights reserved.\n\n");
 
@@ -642,6 +661,7 @@ int main(int argc, char* argv[]) {
 
 	device devices[g_num_devices];
 	g_devices = devices;
+
 
 	g_p_large_block_read_histogram = histogram_create();
 	g_p_large_block_write_histogram = histogram_create();
@@ -767,8 +787,7 @@ int main(int argc, char* argv[]) {
 			exit(-1);
 		} 
 	}
-
- 
+	
 	fprintf(stdout, "\n");
 	uint64_t now_ms;
 	uint64_t time_count = 0;
@@ -804,6 +823,8 @@ int main(int argc, char* argv[]) {
 		histogram_dump(g_p_large_block_read_histogram,  "LARGE BLOCK READS ");
 		histogram_dump(g_p_large_block_write_histogram, "LARGE BLOCK WRITES");
 		histogram_dump(g_p_raw_read_histogram,          "RAW READS         ");
+		
+		//fprintf(stdout, "timer events : %ld\n", g_timer_events);
 		int d;
 		for (d = 0; d < g_num_devices; d++) {			
 			histogram_dump(g_devices[d].p_raw_read_histogram,
@@ -816,7 +837,9 @@ int main(int argc, char* argv[]) {
 		fflush(stdout);
 	}
 	fprintf(stdout, "\nTEST COMPLETED \n");
-
+	
+	//fprintf(stdout, "timer events in 3600 seconds : %ld\n", g_timer_events);
+	
 	g_running = 0;
 	int i;
 	/* Freeing resources used by async */
