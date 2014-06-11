@@ -334,7 +334,6 @@ static void* generate_async_reads(void* aio_context)
 				goto fail;
 			}
 		}
-		cf_atomic_int_incr(&g_read_reqs_queued); 
 		if (cf_atomic_int_incr(&g_read_reqs_queued) > MAX_READ_REQS_QUEUED) 
 		{
 		  fprintf(stdout, "ERROR: too many read reqs queued\n");
